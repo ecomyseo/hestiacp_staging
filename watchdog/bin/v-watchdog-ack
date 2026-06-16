@@ -1,0 +1,90 @@
+#!/bin/bash
+# v-watchdog-ack - Marca alertas como reconocidas (ACK) en el journal.
+# Reescribe state/alerts.ndjson de forma atomica poniendo ack=1 en la(s)
+# entrada(s) indicadas por id, o en todas con --all. Limpia ademas la marca de
+# "alerta abierta" y la ventana anti-duplicado de esa condicion para permitir
+# un nuevo aviso si la condicion reaparece tras el ACK.
+set -euo pipefail
+
+WD_BIN_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+WD_ROOT="$(cd -P "${WD_BIN_DIR}/.." >/dev/null 2>&1 && pwd)"
+export WD_ROOT
+# shellcheck source=../lib/common.sh
+. "${WD_ROOT}/lib/common.sh"
+
+WD_ALERTS_JOURNAL="${WD_STATE_DIR}/alerts.ndjson"
+
+usage() {
+    cat <<'EOF'
+Uso:
+  v-watchdog-ack ID [ID...]   Marca como reconocidas las alertas indicadas.
+  v-watchdog-ack --all        Marca como reconocidas TODAS las alertas abiertas.
+
+Opciones:
+  -h, --help   Esta ayuda.
+
+Reconocer una alerta no la borra: solo la oculta del listado 'open' y permite
+que se vuelva a notificar si la condicion reaparece.
+EOF
+}
+
+ALL=0
+IDS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --all) ALL=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *[!0-9]*) echo "Argumento invalido (se espera id numerico): $1" >&2; exit 2 ;;
+        *) IDS+=("$1"); shift ;;
+    esac
+done
+
+if [ "$ALL" -eq 0 ] && [ "${#IDS[@]}" -eq 0 ]; then
+    echo "Indica al menos un id o usa --all." >&2
+    usage >&2
+    exit 2
+fi
+
+if [ ! -f "$WD_ALERTS_JOURNAL" ]; then
+    echo "No hay journal de alertas." >&2
+    exit 0
+fi
+
+field() { printf '%s' "$1" | sed -n "s/.*\"${2}\":\"\\(\\([^\"\\\\]\\|\\\\.\\)*\\)\".*/\\1/p" | head -n 1; }
+field_num() { printf '%s' "$1" | sed -n "s/.*\"${2}\":\\([0-9]*\\).*/\\1/p" | head -n 1; }
+
+# Comprueba si un id esta en la lista solicitada.
+id_requested() {
+    local id="$1" want
+    [ "$ALL" -eq 1 ] && return 0
+    for want in "${IDS[@]}"; do
+        [ "$want" = "$id" ] && return 0
+    done
+    return 1
+}
+
+tmp="$(mktemp "${WD_ALERTS_JOURNAL}.XXXXXX")"
+changed=0
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    id="$(field_num "$line" id)"
+    ack="$(field_num "$line" ack)"
+    if [ -n "$id" ] && id_requested "$id" && [ "$ack" != "1" ]; then
+        # Sustituye ack:0 por ack:1 en esta linea.
+        newline="$(printf '%s' "$line" | sed 's/"ack":0/"ack":1/')"
+        printf '%s\n' "$newline" >> "$tmp"
+        changed=$(( changed + 1 ))
+        # Resetea ventana anti-duplicado y marca de abierta para esa condicion.
+        check="$(field "$line" check)"
+        metric="$(field "$line" metric)"
+        nkey="$(printf '%s' "${check}_${metric%%=*}" | tr -c 'A-Za-z0-9._-' '_')"
+        wd_state_set "notify_${nkey}" "0" 2>/dev/null || true
+        wd_state_set "resolved_open_${nkey}" "0" 2>/dev/null || true
+        wd_log "INFO" "Alerta #${id} reconocida (ACK) por ${USER:-operador}."
+    else
+        printf '%s\n' "$line" >> "$tmp"
+    fi
+done < "$WD_ALERTS_JOURNAL"
+
+mv -f "$tmp" "$WD_ALERTS_JOURNAL"
+echo "Alertas reconocidas: ${changed}."

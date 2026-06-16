@@ -1,0 +1,86 @@
+#!/bin/bash
+# v-watchdog-debug - Activa/desactiva la depuracion y muestra diagnostico.
+# Con 'on'/'off' alterna DEBUG en conf. Sin argumentos (o con 'status') vuelca
+# un diagnostico del entorno: rutas, version del panel, comandos v-* presentes,
+# estado del kill switch, ultima ejecucion y cola del log.
+set -euo pipefail
+
+WD_BIN_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+WD_ROOT="$(cd -P "${WD_BIN_DIR}/.." >/dev/null 2>&1 && pwd)"
+export WD_ROOT
+# shellcheck source=../lib/common.sh
+. "${WD_ROOT}/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Uso: v-watchdog-debug [on|off|status|log [N]]
+
+  on       Activa DEBUG='true' (logs verbosos en logs/watchdog.log).
+  off      Desactiva DEBUG='false'.
+  status   (por defecto) Vuelca diagnostico del entorno.
+  log [N]  Muestra las ultimas N lineas del log (50 por defecto).
+  -h,--help  Esta ayuda.
+EOF
+}
+
+ACTION="${1:-status}"
+case "$ACTION" in
+    -h|--help) usage; exit 0 ;;
+    on)
+        wd_conf_set DEBUG true
+        echo "DEBUG activado. Logs verbosos en ${WD_LOG_FILE}."
+        wd_log "INFO" "DEBUG activado por ${USER:-operador}."
+        ;;
+    off)
+        wd_conf_set DEBUG false
+        echo "DEBUG desactivado."
+        wd_log "INFO" "DEBUG desactivado por ${USER:-operador}."
+        ;;
+    log)
+        N="${2:-50}"
+        case "$N" in ''|*[!0-9]*) N=50 ;; esac
+        if [ -f "$WD_LOG_FILE" ]; then
+            tail -n "$N" "$WD_LOG_FILE"
+        else
+            echo "Sin log todavia ($WD_LOG_FILE)."
+        fi
+        ;;
+    status)
+        HESTIA="${HESTIA:-/usr/local/hestia}"
+        echo "== Watchdog :: diagnostico =="
+        echo "WD_ROOT       : $WD_ROOT"
+        echo "WD_CONF       : $WD_CONF"
+        echo "WD_STATE_DIR  : $WD_STATE_DIR"
+        echo "WD_LOG_DIR    : $WD_LOG_DIR"
+        echo "DEBUG         : $(wd_conf_get DEBUG false)"
+        echo "KILL_SWITCH   : $(wd_conf_get WD_KILL_SWITCH true)"
+        echo "Notify window : $(wd_conf_get WD_NOTIFY_WINDOW 30) min"
+        echo "Canales       : email=$(wd_conf_get WD_CHANNEL_EMAIL false) telegram=$(wd_conf_get WD_CHANNEL_TELEGRAM false) webhook=$(wd_conf_get WD_CHANNEL_WEBHOOK false)"
+        lr="$(wd_state_get last_run 0)"
+        if [ "$lr" != "0" ]; then
+            echo "Ultima exec   : $(date -d "@${lr}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "@${lr}") ($(wd_state_get last_run_duration 0)s)"
+        else
+            echo "Ultima exec   : (ninguna)"
+        fi
+        echo "Categorias    : $(wd_state_get categories '(ninguna)')"
+        echo
+        echo "-- Comandos HestiaCP detectados --"
+        for cmd in v-list-sys-services v-restart-service v-list-users v-list-web-domains v-add-cron-job v-list-cron-jobs v-send-mail; do
+            if command -v "$cmd" >/dev/null 2>&1 || [ -x "$HESTIA/bin/$cmd" ]; then
+                echo "  [OK]    $cmd"
+            else
+                echo "  [FALTA] $cmd"
+            fi
+        done
+        echo
+        echo "-- Herramientas --"
+        for t in flock curl jq awk sed; do
+            if command -v "$t" >/dev/null 2>&1; then echo "  [OK]    $t"; else echo "  [FALTA] $t"; fi
+        done
+        echo
+        echo "-- Ultimas 20 lineas de log --"
+        if [ -f "$WD_LOG_FILE" ]; then tail -n 20 "$WD_LOG_FILE"; else echo "(sin log)"; fi
+        ;;
+    *)
+        echo "Accion desconocida: $ACTION" >&2; usage >&2; exit 2 ;;
+esac

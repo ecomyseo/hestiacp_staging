@@ -1,0 +1,100 @@
+#!/bin/bash
+# v-watchdog-status - Estado agregado del Watchdog (semaforo por categoria).
+# Lee el estado persistido por v-watchdog-run en state/ y lo muestra en uno de
+# tres formatos: json (por defecto), shell (KEY='VALUE') o plain (legible).
+# No ejecuta checks: solo refleja la ultima ejecucion registrada.
+set -euo pipefail
+
+WD_BIN_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+WD_ROOT="$(cd -P "${WD_BIN_DIR}/.." >/dev/null 2>&1 && pwd)"
+export WD_ROOT
+# shellcheck source=../lib/common.sh
+. "${WD_ROOT}/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Uso: v-watchdog-status [json|shell|plain]
+
+Muestra el estado agregado del Watchdog (semaforo por categoria) segun la
+ultima ejecucion registrada en state/.
+
+Formatos:
+  json   (por defecto) Objeto JSON con last_run y categorias.
+  shell  Pares KEY='VALUE' para consumo por scripts.
+  plain  Texto legible para humanos.
+
+  -h, --help  Esta ayuda.
+EOF
+}
+
+FORMAT="json"
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    json|shell|plain) FORMAT="$1" ;;
+    "") FORMAT="json" ;;
+    *) echo "Formato desconocido: $1" >&2; usage >&2; exit 2 ;;
+esac
+
+# Escapado JSON minimo.
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '; }
+
+LAST_RUN="$(wd_state_get last_run 0)"
+DURATION="$(wd_state_get last_run_duration 0)"
+KILL="$(wd_conf_get WD_KILL_SWITCH true)"
+CATEGORIES="$(wd_state_get categories '')"
+
+# Severidad global = la peor entre todas las categorias.
+sev_rank() { case "$1" in CRITICAL) echo 3;; WARNING) echo 2;; INFO) echo 1;; *) echo 0;; esac; }
+GLOBAL_SEV="INFO"
+for c in $CATEGORIES; do
+    s="$(wd_state_get "cat_${c}_sev" INFO)"
+    [ "$(sev_rank "$s")" -gt "$(sev_rank "$GLOBAL_SEV")" ] && GLOBAL_SEV="$s"
+done
+
+case "$FORMAT" in
+    json)
+        printf '{'
+        printf '"last_run":%s,' "${LAST_RUN:-0}"
+        printf '"duration":%s,' "${DURATION:-0}"
+        printf '"kill_switch":"%s",' "$(json_escape "$KILL")"
+        printf '"global_severity":"%s",' "$(json_escape "$GLOBAL_SEV")"
+        printf '"categories":['
+        first=1
+        for c in $CATEGORIES; do
+            [ "$first" -eq 1 ] || printf ','
+            first=0
+            printf '{"name":"%s","severity":"%s","ts":%s,"msg":"%s"}' \
+                "$(json_escape "$c")" \
+                "$(json_escape "$(wd_state_get "cat_${c}_sev" INFO)")" \
+                "$(wd_state_get "cat_${c}_ts" 0)" \
+                "$(json_escape "$(wd_state_get "cat_${c}_msg" '')")"
+        done
+        printf ']}'
+        printf '\n'
+        ;;
+    shell)
+        printf "LAST_RUN='%s'\n" "$LAST_RUN"
+        printf "DURATION='%s'\n" "$DURATION"
+        printf "KILL_SWITCH='%s'\n" "$KILL"
+        printf "GLOBAL_SEVERITY='%s'\n" "$GLOBAL_SEV"
+        for c in $CATEGORIES; do
+            uc="$(printf '%s' "$c" | tr '[:lower:].-' '[:upper:]__')"
+            printf "CAT_%s_SEV='%s'\n" "$uc" "$(wd_state_get "cat_${c}_sev" INFO)"
+            printf "CAT_%s_MSG='%s'\n" "$uc" "$(wd_state_get "cat_${c}_msg" '')"
+        done
+        ;;
+    plain)
+        if [ "${LAST_RUN:-0}" = "0" ]; then
+            echo "Watchdog: sin ejecuciones registradas todavia."
+        else
+            echo "Watchdog - estado global: ${GLOBAL_SEV}"
+            echo "Ultima ejecucion: $(date -d "@${LAST_RUN}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "@${LAST_RUN}") (${DURATION}s)"
+            echo "Kill switch: ${KILL}"
+            echo "Categorias:"
+            for c in $CATEGORIES; do
+                printf '  [%-8s] %-12s %s\n' \
+                    "$(wd_state_get "cat_${c}_sev" INFO)" "$c" "$(wd_state_get "cat_${c}_msg" '')"
+            done
+        fi
+        ;;
+esac

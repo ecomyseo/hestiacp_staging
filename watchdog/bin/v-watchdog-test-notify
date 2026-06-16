@@ -1,0 +1,96 @@
+#!/bin/bash
+# v-watchdog-test-notify - Envia una notificacion de prueba por los canales.
+# Permite validar la configuracion de email/Telegram/webhook ANTES de poner el
+# KILL SWITCH en produccion. REGLA ANTI-CATASTROFE: si el KILL SWITCH esta
+# activo, por defecto NO envia (solo informa). Usa --force para enviar igualmente
+# una unica prueba puntual aunque el kill switch siga activo (no toca historico,
+# es un mensaje unico generado en el momento).
+set -euo pipefail
+
+WD_BIN_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+WD_ROOT="$(cd -P "${WD_BIN_DIR}/.." >/dev/null 2>&1 && pwd)"
+export WD_ROOT
+# shellcheck source=../lib/common.sh
+. "${WD_ROOT}/lib/common.sh"
+
+WD_NOTIFIERS_DIR="${WD_ROOT}/notifiers"
+
+usage() {
+    cat <<'EOF'
+Uso: v-watchdog-test-notify [--channel CANAL] [--force]
+
+Envia un mensaje de prueba por los canales de notificacion activos.
+
+Opciones:
+  --channel CANAL  Solo este canal (email|telegram|webhook|slack|discord).
+                   Por defecto: todos los activos en conf.
+  --force          Envia aunque WD_KILL_SWITCH='true' (mensaje unico de prueba).
+  -h, --help       Esta ayuda.
+
+Sin --force y con el kill switch activo, NO se envia nada (solo se informa).
+EOF
+}
+
+ONLY_CHANNEL=""
+FORCE=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --channel) ONLY_CHANNEL="${2:-}"; shift 2 ;;
+        --channel=*) ONLY_CHANNEL="${1#*=}"; shift ;;
+        --force) FORCE=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Opcion desconocida: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+KILL="$(wd_conf_get WD_KILL_SWITCH true)"
+if [ "$KILL" = "true" ] && [ "$FORCE" -ne 1 ]; then
+    echo "KILL SWITCH activo (WD_KILL_SWITCH='true'): no se envia nada."
+    echo "Usa --force para enviar UNA prueba puntual, o pon WD_KILL_SWITCH='false' en conf."
+    exit 0
+fi
+
+HOST="$(hostname 2>/dev/null || echo host)"
+SEVERITY="INFO"
+TITLE="Watchdog: notificacion de prueba (${HOST})"
+BODY="Esta es una prueba de notificacion del Watchdog de HestiaCP.
+Fecha: $(date '+%Y-%m-%d %H:%M:%S')
+Si recibes este mensaje, el canal esta correctamente configurado."
+
+# Lista de canales a probar.
+channels="email telegram webhook slack discord"
+[ -n "$ONLY_CHANNEL" ] && channels="$ONLY_CHANNEL"
+
+any=0
+for ch in $channels; do
+    case "$ch" in
+        email)    enabled="$(wd_conf_get WD_CHANNEL_EMAIL false)" ;;
+        telegram) enabled="$(wd_conf_get WD_CHANNEL_TELEGRAM false)" ;;
+        webhook)  enabled="$(wd_conf_get WD_CHANNEL_WEBHOOK false)" ;;
+        slack)    enabled="$(wd_conf_get WD_CHANNEL_SLACK false)" ;;
+        discord)  enabled="$(wd_conf_get WD_CHANNEL_DISCORD false)" ;;
+        *) echo "Canal desconocido: $ch" >&2; continue ;;
+    esac
+    # Con --channel explicito probamos aunque la conf lo marque como inactivo.
+    if [ -z "$ONLY_CHANNEL" ] && [ "$enabled" != "true" ]; then
+        continue
+    fi
+    script="${WD_NOTIFIERS_DIR}/${ch}.sh"
+    if [ ! -f "$script" ]; then
+        echo "Notificador no encontrado: ${script}" >&2
+        continue
+    fi
+    any=1
+    printf 'Probando canal %s... ' "$ch"
+    if WD_ROOT="$WD_ROOT" WD_CONF="$WD_CONF" bash "$script" "$SEVERITY" "$TITLE" "$BODY"; then
+        echo "OK"
+        wd_log "INFO" "Prueba de notificacion enviada por ${ch}."
+    else
+        echo "FALLO (revisa credenciales y logs)"
+        wd_log "ERROR" "Fallo la prueba de notificacion por ${ch}."
+    fi
+done
+
+if [ "$any" -eq 0 ]; then
+    echo "No hay canales activos que probar. Activa alguno en conf (WD_CHANNEL_*) o usa --channel."
+fi

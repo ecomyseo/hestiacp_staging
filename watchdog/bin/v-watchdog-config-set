@@ -1,0 +1,102 @@
+#!/bin/bash
+# v-watchdog-config-set - Escribe/actualiza una clave de configuracion.
+# Valida la clave contra una lista blanca y aplica saneado por tipo antes de
+# delegar en wd_conf_set (escritura atomica). Este es el UNICO punto por el que
+# la UI web modifica la configuracion: el PHP NO edita ficheros directamente.
+# Avisos especiales al desactivar el KILL SWITCH (accion sensible).
+set -euo pipefail
+
+WD_BIN_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+WD_ROOT="$(cd -P "${WD_BIN_DIR}/.." >/dev/null 2>&1 && pwd)"
+export WD_ROOT
+# shellcheck source=../lib/common.sh
+. "${WD_ROOT}/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Uso: v-watchdog-config-set KEY VALUE
+
+Actualiza una clave permitida de conf/watchdog.conf (escritura atomica).
+
+Claves permitidas:
+  WD_KILL_SWITCH (true|false)
+  WD_NOTIFY_WINDOW (entero min)   WD_RATE_MAX_HOUR (entero)
+  WD_ESCALATE_AFTER (entero)      WD_DIGEST (true|false)
+  WD_CHANNEL_EMAIL/TELEGRAM/WEBHOOK/SLACK/DISCORD (true|false)
+  WD_EMAIL_TO, WD_TELEGRAM_TOKEN, WD_TELEGRAM_CHAT_ID,
+  WD_WEBHOOK_URL, WD_SLACK_WEBHOOK, WD_DISCORD_WEBHOOK
+  DEBUG (true|false)
+  Umbrales: WD_CPU_WARN/CRIT, WD_RAM_WARN/CRIT, WD_DISK_WARN/CRIT,
+            WD_LOAD_WARN/CRIT, RES_* , SERVICES_HYSTERESIS, SERVICES_WATCH
+
+  -h, --help   Esta ayuda.
+EOF
+}
+
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+KEY="${1:-}"
+VALUE="${2:-}"
+if [ -z "$KEY" ]; then
+    echo "Falta KEY." >&2; usage >&2; exit 2
+fi
+
+# Lista blanca de claves modificables.
+case "$KEY" in
+    WD_KILL_SWITCH|WD_DIGEST|DEBUG| \
+    WD_CHANNEL_EMAIL|WD_CHANNEL_TELEGRAM|WD_CHANNEL_WEBHOOK|WD_CHANNEL_SLACK|WD_CHANNEL_DISCORD| \
+    WD_NOTIFY_WINDOW|WD_RATE_MAX_HOUR|WD_ESCALATE_AFTER| \
+    WD_EMAIL_TO|WD_TELEGRAM_TOKEN|WD_TELEGRAM_CHAT_ID|WD_WEBHOOK_URL|WD_SLACK_WEBHOOK|WD_DISCORD_WEBHOOK| \
+    WD_CPU_WARN|WD_CPU_CRIT|WD_RAM_WARN|WD_RAM_CRIT|WD_DISK_WARN|WD_DISK_CRIT|WD_LOAD_WARN|WD_LOAD_CRIT| \
+    RES_CPU_WARN|RES_CPU_CRIT|RES_MEM_WARN|RES_MEM_CRIT|RES_SWAP_WARN|RES_SWAP_CRIT| \
+    RES_LOAD_WARN|RES_LOAD_CRIT|RES_DISK_WARN|RES_DISK_CRIT|RES_INODE_WARN|RES_INODE_CRIT| \
+    RES_HYSTERESIS|SERVICES_HYSTERESIS|SERVICES_WATCH)
+        ;;
+    *)
+        echo "Clave no permitida: ${KEY}" >&2
+        exit 2
+        ;;
+esac
+
+# Saneado por tipo.
+case "$KEY" in
+    WD_KILL_SWITCH|WD_DIGEST|DEBUG|WD_CHANNEL_EMAIL|WD_CHANNEL_TELEGRAM|WD_CHANNEL_WEBHOOK|WD_CHANNEL_SLACK|WD_CHANNEL_DISCORD)
+        case "$VALUE" in
+            true|false) ;;
+            *) echo "Valor invalido para ${KEY} (se espera true|false): ${VALUE}" >&2; exit 2 ;;
+        esac
+        ;;
+    WD_NOTIFY_WINDOW|WD_RATE_MAX_HOUR|WD_ESCALATE_AFTER| \
+    WD_CPU_WARN|WD_CPU_CRIT|WD_RAM_WARN|WD_RAM_CRIT|WD_DISK_WARN|WD_DISK_CRIT| \
+    RES_CPU_WARN|RES_CPU_CRIT|RES_MEM_WARN|RES_MEM_CRIT|RES_SWAP_WARN|RES_SWAP_CRIT| \
+    RES_DISK_WARN|RES_DISK_CRIT|RES_INODE_WARN|RES_INODE_CRIT|RES_HYSTERESIS|SERVICES_HYSTERESIS)
+        case "$VALUE" in
+            ''|*[!0-9]*) echo "Valor invalido para ${KEY} (se espera entero): ${VALUE}" >&2; exit 2 ;;
+        esac
+        ;;
+    WD_LOAD_WARN|WD_LOAD_CRIT|RES_LOAD_WARN|RES_LOAD_CRIT)
+        case "$VALUE" in
+            ''|*[!0-9.]*) echo "Valor invalido para ${KEY} (se espera numero): ${VALUE}" >&2; exit 2 ;;
+        esac
+        ;;
+    WD_EMAIL_TO)
+        # Email simple o vacio.
+        if [ -n "$VALUE" ] && ! printf '%s' "$VALUE" | grep -qE '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'; then
+            echo "Email invalido: ${VALUE}" >&2; exit 2
+        fi
+        ;;
+    WD_WEBHOOK_URL|WD_SLACK_WEBHOOK|WD_DISCORD_WEBHOOK)
+        if [ -n "$VALUE" ] && ! printf '%s' "$VALUE" | grep -qE '^https?://'; then
+            echo "URL invalida (debe empezar por http:// o https://): ${VALUE}" >&2; exit 2
+        fi
+        ;;
+esac
+
+# Aviso de seguridad al desactivar el kill switch.
+if [ "$KEY" = "WD_KILL_SWITCH" ] && [ "$VALUE" = "false" ]; then
+    wd_log "WARN" "KILL SWITCH DESACTIVADO por ${USER:-operador}: las notificaciones quedan habilitadas."
+fi
+
+wd_conf_set "$KEY" "$VALUE"
+wd_log "INFO" "Config actualizada: ${KEY} (por ${USER:-operador})."
+echo "OK: ${KEY} actualizado."

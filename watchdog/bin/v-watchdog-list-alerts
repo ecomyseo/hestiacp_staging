@@ -1,0 +1,113 @@
+#!/bin/bash
+# v-watchdog-list-alerts - Lista las alertas registradas en el journal.
+# Lee state/alerts.ndjson (escrito por v-watchdog-run) y permite filtrar por
+# severidad, estado de ACK y limitar el numero de resultados. Salida json o
+# plain. No modifica nada (solo lectura).
+set -euo pipefail
+
+WD_BIN_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+WD_ROOT="$(cd -P "${WD_BIN_DIR}/.." >/dev/null 2>&1 && pwd)"
+export WD_ROOT
+# shellcheck source=../lib/common.sh
+. "${WD_ROOT}/lib/common.sh"
+
+WD_ALERTS_JOURNAL="${WD_STATE_DIR}/alerts.ndjson"
+
+usage() {
+    cat <<'EOF'
+Uso: v-watchdog-list-alerts [opciones]
+
+Lista las alertas registradas (state/alerts.ndjson).
+
+Opciones:
+  --severity SEV   Filtra por severidad (WARNING|CRITICAL).
+  --status EST     Filtra por estado: open (sin ACK) | acked (con ACK) | all.
+                   Por defecto: open.
+  --limit N        Maximo de alertas a mostrar (mas recientes primero). 50 def.
+  --format FMT     json (def) | plain.
+  -h, --help       Esta ayuda.
+EOF
+}
+
+SEVERITY=""
+STATUS="open"
+LIMIT=50
+FORMAT="json"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --severity) SEVERITY="${2:-}"; shift 2 ;;
+        --severity=*) SEVERITY="${1#*=}"; shift ;;
+        --status) STATUS="${2:-}"; shift 2 ;;
+        --status=*) STATUS="${1#*=}"; shift ;;
+        --limit) LIMIT="${2:-}"; shift 2 ;;
+        --limit=*) LIMIT="${1#*=}"; shift ;;
+        --format) FORMAT="${2:-}"; shift 2 ;;
+        --format=*) FORMAT="${1#*=}"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Opcion desconocida: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+case "$LIMIT" in ''|*[!0-9]*) LIMIT=50 ;; esac
+
+field() { printf '%s' "$1" | sed -n "s/.*\"${2}\":\"\\(\\([^\"\\\\]\\|\\\\.\\)*\\)\".*/\\1/p" | head -n 1; }
+field_num() { printf '%s' "$1" | sed -n "s/.*\"${2}\":\\([0-9]*\\).*/\\1/p" | head -n 1; }
+
+if [ ! -f "$WD_ALERTS_JOURNAL" ] || [ ! -s "$WD_ALERTS_JOURNAL" ]; then
+    [ "$FORMAT" = "json" ] && echo '[]' || echo "Sin alertas registradas."
+    exit 0
+fi
+
+# Recorre de la mas reciente a la mas antigua y aplica filtros.
+mapfile -t LINES < <(tac "$WD_ALERTS_JOURNAL")
+
+count=0
+out=""
+for line in "${LINES[@]}"; do
+    [ -z "$line" ] && continue
+    sev="$(field "$line" severity)"
+    ack="$(field_num "$line" ack)"
+    [ -z "$ack" ] && ack=0
+
+    # Filtro severidad.
+    if [ -n "$SEVERITY" ] && [ "$sev" != "$SEVERITY" ]; then
+        continue
+    fi
+    # Filtro estado.
+    case "$STATUS" in
+        open)  [ "$ack" = "0" ] || continue ;;
+        acked) [ "$ack" = "1" ] || continue ;;
+        all|"") : ;;
+        *) echo "Estado invalido: $STATUS" >&2; exit 2 ;;
+    esac
+
+    count=$(( count + 1 ))
+    [ "$count" -gt "$LIMIT" ] && break
+
+    if [ "$FORMAT" = "plain" ]; then
+        id="$(field_num "$line" id)"
+        ts="$(field_num "$line" ts)"
+        check="$(field "$line" check)"
+        metric="$(field "$line" metric)"
+        msg="$(field "$line" msg)"
+        when="$(date -d "@${ts}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "@${ts}")"
+        ackmark="[ ]"; [ "$ack" = "1" ] && ackmark="[x]"
+        printf '%s #%-5s %-9s %-10s %s :: %s\n' "$ackmark" "${id:-?}" "$sev" "$check" "$metric" "$msg"
+    else
+        out="${out}${line}
+"
+    fi
+done
+
+if [ "$FORMAT" = "json" ]; then
+    printf '['
+    first=1
+    while IFS= read -r l; do
+        [ -z "$l" ] && continue
+        [ "$first" -eq 1 ] || printf ','
+        first=0
+        printf '%s' "$l"
+    done <<< "$out"
+    printf ']\n'
+fi

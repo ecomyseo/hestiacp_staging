@@ -1,0 +1,276 @@
+#!/bin/bash
+# v-watchdog-run - Orquestador del plugin Watchdog para HestiaCP.
+# Ejecuta los checks activos con bloqueo anti-concurrencia (flock), agrega sus
+# resultados NDJSON, actualiza el estado para el dashboard (semaforo por
+# categoria), registra las alertas en un journal consultable (con ACK) y
+# canaliza la salida al motor de alertas (lib/alerts.sh), que ya respeta el
+# KILL SWITCH y la ventana anti-duplicado. NUNCA recorre historicos ni dispara
+# acciones por registros antiguos: solo notifica lo producido en esta ejecucion.
+set -euo pipefail
+
+WD_BIN_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+WD_ROOT="$(cd -P "${WD_BIN_DIR}/.." >/dev/null 2>&1 && pwd)"
+export WD_ROOT
+# shellcheck source=../lib/common.sh
+. "${WD_ROOT}/lib/common.sh"
+
+WD_CHECKS_DIR="${WD_ROOT}/checks"
+WD_ALERTS_LIB="${WD_ROOT}/lib/alerts.sh"
+WD_LOCK_FILE="${WD_STATE_DIR}/.run.lock"
+WD_ALERTS_JOURNAL="${WD_STATE_DIR}/alerts.ndjson"
+
+usage() {
+    cat <<'EOF'
+Uso: v-watchdog-run [run] [opciones]
+
+Ejecuta los checks activos del Watchdog, agrega resultados y notifica.
+
+Opciones:
+  --only LISTA     Ejecuta solo los checks indicados (coma/espacio).
+                   Ej: --only services,resources
+  --dry-run        Ejecuta y registra, pero NO envia ninguna notificacion.
+  -h, --help       Muestra esta ayuda.
+
+Checks disponibles: ficheros *.sh en checks/ (services, resources, http,
+database, ssl, dns, exim_queue, backups, security...).
+
+Estado y dashboard se actualizan en state/. El KILL SWITCH y la ventana
+anti-duplicado se aplican en lib/alerts.sh.
+EOF
+}
+
+ONLY=""
+DRY_RUN=0
+
+# El primer argumento puede ser el verbo 'run' (compatibilidad con cron).
+[ "${1:-}" = "run" ] && shift || true
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --only) ONLY="${2:-}"; shift 2 ;;
+        --only=*) ONLY="${1#*=}"; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        run) shift ;;
+        *) echo "Opcion desconocida: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+# Devuelve la lista de checks a ejecutar (rutas absolutas, una por linea).
+wd_select_checks() {
+    if [ -n "$ONLY" ]; then
+        local name f
+        for name in $(printf '%s' "$ONLY" | tr ',' ' '); do
+            [ -z "$name" ] && continue
+            f="${WD_CHECKS_DIR}/${name}.sh"
+            if [ -f "$f" ]; then
+                printf '%s\n' "$f"
+            else
+                wd_log "WARN" "Check solicitado no existe: ${name} (${f})"
+            fi
+        done
+        return 0
+    fi
+    # Por defecto: todos los *.sh del directorio checks/.
+    local f
+    for f in "${WD_CHECKS_DIR}"/*.sh; do
+        [ -f "$f" ] || continue
+        printf '%s\n' "$f"
+    done
+}
+
+# Rango de severidad para calcular la peor por categoria.
+wd_sev_rank() {
+    case "$1" in
+        CRITICAL) printf '3' ;;
+        WARNING)  printf '2' ;;
+        INFO)     printf '1' ;;
+        *)        printf '0' ;;
+    esac
+}
+
+# Extrae un campo string del NDJSON de wd_emit (parser ligero, sin jq).
+wd_field() {
+    local line="$1" field="$2"
+    printf '%s' "$line" | sed -n "s/.*\"${field}\":\"\\(\\([^\"\\\\]\\|\\\\.\\)*\\)\".*/\\1/p" | head -n 1
+}
+
+# Cuerpo real de la ejecucion (se invoca bajo flock).
+wd_run_body() {
+    local started_at
+    started_at="$(date +%s)"
+    wd_log "INFO" "Inicio de ejecucion (dry-run=${DRY_RUN}, only='${ONLY:-todos}')."
+
+    local checks
+    checks="$(wd_select_checks)"
+    if [ -z "$checks" ]; then
+        wd_log "WARN" "No hay checks que ejecutar."
+        echo "No hay checks que ejecutar." >&2
+        return 0
+    fi
+
+    # Fichero temporal con la salida agregada (NDJSON) de todos los checks.
+    local agg
+    agg="$(mktemp "${WD_STATE_DIR}/.agg.XXXXXX")"
+    trap 'rm -f "$agg" 2>/dev/null || true' RETURN
+
+    # Acumuladores de semaforo por categoria (peor severidad observada).
+    declare -A cat_sev
+    declare -A cat_msg
+
+    local f name
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        name="$(basename "$f" .sh)"
+        wd_log "DEBUG" "Ejecutando check: ${name}"
+        local out=""
+        # Aisla el fallo de un check para no abortar el resto (set -e).
+        if ! out="$(bash "$f" 2>>"$WD_LOG_FILE")"; then
+            wd_log "ERROR" "El check ${name} termino con error; se continua."
+        fi
+        [ -z "$out" ] && continue
+        printf '%s\n' "$out" >> "$agg"
+
+        # Calcula la peor severidad por categoria para el dashboard.
+        local line sev metric msg rank cur
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in *'"severity"'*) ;; *) continue ;; esac
+            sev="$(wd_field "$line" severity)"
+            metric="$(wd_field "$line" metric)"
+            msg="$(wd_field "$line" msg)"
+            cur="${cat_sev[$name]:-INFO}"
+            rank="$(wd_sev_rank "$sev")"
+            if [ "$rank" -ge "$(wd_sev_rank "$cur")" ]; then
+                cat_sev[$name]="$sev"
+                cat_msg[$name]="${metric} :: ${msg}"
+            fi
+        done <<< "$out"
+    done <<< "$checks"
+
+    # Persiste el semaforo por categoria en state/ (lo lee el dashboard web).
+    local c now
+    now="$(date +%s)"
+    for c in "${!cat_sev[@]}"; do
+        wd_state_set "cat_${c}_sev" "${cat_sev[$c]}"
+        wd_state_set "cat_${c}_msg" "${cat_msg[$c]:-}"
+        wd_state_set "cat_${c}_ts" "$now"
+    done
+    # Indice de categorias evaluadas (para que el dashboard sepa que mostrar).
+    wd_state_set "categories" "$(printf '%s\n' "${!cat_sev[@]}" | sort | tr '\n' ' ')"
+
+    # Registra en el journal las alertas WARNING/CRITICAL de esta ejecucion.
+    wd_journal_append "$agg"
+
+    # Notifica: canaliza el agregado al motor de alertas (respeta KILL SWITCH).
+    if [ "$DRY_RUN" -eq 1 ]; then
+        wd_log "INFO" "DRY-RUN: no se invoca el motor de alertas."
+    else
+        if [ -f "$WD_ALERTS_LIB" ]; then
+            WD_ROOT="$WD_ROOT" WD_CONF="$WD_CONF" bash "$WD_ALERTS_LIB" < "$agg" || \
+                wd_log "ERROR" "El motor de alertas devolvio error."
+        else
+            wd_log "ERROR" "No se encuentra el motor de alertas: ${WD_ALERTS_LIB}"
+        fi
+    fi
+
+    wd_state_set "last_run" "$now"
+    wd_state_set "last_run_duration" "$(( now - started_at ))"
+    wd_log "INFO" "Fin de ejecucion ($(( now - started_at ))s)."
+}
+
+# Anexa al journal de alertas las lineas WARNING/CRITICAL del agregado.
+# Cada entrada lleva id incremental, ts epoch y ack=0. Append-only y acotado.
+wd_journal_append() {
+    local agg="$1"
+    [ -f "$agg" ] || return 0
+    [ -f "$WD_ALERTS_JOURNAL" ] || : > "$WD_ALERTS_JOURNAL"
+
+    local line sev check metric msg id now
+    local e_check e_metric e_msg
+    now="$(date +%s)"
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        case "$line" in *'"severity"'*) ;; *) continue ;; esac
+        sev="$(wd_field "$line" severity)"
+        case "$sev" in WARNING|CRITICAL) ;; *) continue ;; esac
+        check="$(wd_field "$line" check)"
+        metric="$(wd_field "$line" metric)"
+        msg="$(wd_field "$line" msg)"
+        # wd_field devuelve los valores DESescapados; hay que reescaparlos antes
+        # de reinyectarlos en el JSON o un valor con comillas/barras invertidas
+        # corrompe el journal y rompe el parseo aguas abajo (mismo patron que
+        # wd_emit en lib/common.sh).
+        e_check="$(printf '%s' "$check" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+        e_metric="$(printf '%s' "$metric" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+        e_msg="$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+        # Id incremental persistente.
+        id="$(wd_state_get alert_seq 0)"
+        case "$id" in ''|*[!0-9]*) id=0 ;; esac
+        id=$(( id + 1 ))
+        wd_state_set alert_seq "$id"
+        printf '{"id":%d,"ts":%d,"check":"%s","severity":"%s","metric":"%s","msg":"%s","ack":0}\n' \
+            "$id" "$now" "$e_check" "$sev" "$e_metric" "$e_msg" >> "$WD_ALERTS_JOURNAL"
+    done < "$agg"
+
+    # Acota el journal a las ultimas 2000 lineas para no crecer sin limite.
+    local total
+    total="$(wc -l < "$WD_ALERTS_JOURNAL" 2>/dev/null || echo 0)"
+    if [ "$total" -gt 2000 ]; then
+        local tmp
+        tmp="$(mktemp "${WD_ALERTS_JOURNAL}.XXXXXX")"
+        tail -n 2000 "$WD_ALERTS_JOURNAL" > "$tmp"
+        mv -f "$tmp" "$WD_ALERTS_JOURNAL"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Bloqueo anti-concurrencia. Si ya hay una ejecucion en curso, sale sin error
+# (no se solapan ejecuciones del cron). Usa flock cuando esta disponible
+# (util-linux); en sistemas sin flock (Alpine, BSD, contenedores minimos) cae
+# a un cerrojo portable basado en 'mkdir', que es atomico en POSIX.
+# ---------------------------------------------------------------------------
+WD_LOCK_DIR="${WD_STATE_DIR}/.run.lock.d"
+WD_LOCK_ACQUIRED=0
+
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$WD_LOCK_FILE"
+    if ! flock -n 9; then
+        wd_log "WARN" "Otra ejecucion en curso (lock ocupado); se omite esta."
+        echo "Watchdog ya en ejecucion; se omite." >&2
+        exit 0
+    fi
+else
+    # Fallback portable: mkdir es atomico. Si el directorio ya existe, otra
+    # ejecucion lo tiene tomado. Comprueba un cerrojo rancio (proceso muerto)
+    # para no quedarse bloqueado tras una caida abrupta.
+    if ! mkdir "$WD_LOCK_DIR" 2>/dev/null; then
+        wd_stale=1
+        if [ -f "${WD_LOCK_DIR}/pid" ]; then
+            wd_old_pid="$(cat "${WD_LOCK_DIR}/pid" 2>/dev/null || printf '')"
+            case "$wd_old_pid" in
+                ''|*[!0-9]*) ;;
+                *) kill -0 "$wd_old_pid" 2>/dev/null && wd_stale=0 ;;
+            esac
+        fi
+        if [ "$wd_stale" -eq 1 ]; then
+            # Cerrojo rancio: lo reclamamos.
+            rm -rf "$WD_LOCK_DIR" 2>/dev/null || true
+            if ! mkdir "$WD_LOCK_DIR" 2>/dev/null; then
+                wd_log "WARN" "Otra ejecucion en curso (lock ocupado); se omite esta."
+                echo "Watchdog ya en ejecucion; se omite." >&2
+                exit 0
+            fi
+        else
+            wd_log "WARN" "Otra ejecucion en curso (lock ocupado); se omite esta."
+            echo "Watchdog ya en ejecucion; se omite." >&2
+            exit 0
+        fi
+    fi
+    WD_LOCK_ACQUIRED=1
+    printf '%s\n' "$$" > "${WD_LOCK_DIR}/pid" 2>/dev/null || true
+    # Libera el cerrojo de mkdir al salir (cualquier causa).
+    trap '[ "$WD_LOCK_ACQUIRED" -eq 1 ] && rm -rf "$WD_LOCK_DIR" 2>/dev/null || true' EXIT
+fi
+
+wd_run_body

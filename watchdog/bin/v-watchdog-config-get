@@ -1,0 +1,89 @@
+#!/bin/bash
+# v-watchdog-config-get - Lee valores de configuracion (conf/watchdog.conf).
+# Devuelve el valor de una clave, o vuelca toda la configuracion en formato
+# shell o json. Los valores sensibles (tokens) se enmascaran salvo --reveal.
+set -euo pipefail
+
+WD_BIN_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+WD_ROOT="$(cd -P "${WD_BIN_DIR}/.." >/dev/null 2>&1 && pwd)"
+export WD_ROOT
+# shellcheck source=../lib/common.sh
+. "${WD_ROOT}/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Uso:
+  v-watchdog-config-get KEY [default]   Muestra el valor de KEY.
+  v-watchdog-config-get --all [shell|json]   Vuelca toda la configuracion.
+
+Opciones:
+  --reveal     No enmascara valores sensibles (tokens, urls de webhook).
+  -h, --help   Esta ayuda.
+EOF
+}
+
+# Claves consideradas sensibles (se enmascaran por defecto).
+is_sensitive() {
+    case "$1" in
+        WD_TELEGRAM_TOKEN|WD_WEBHOOK_URL|WD_SLACK_WEBHOOK|WD_DISCORD_WEBHOOK) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+mask() {
+    local v="$1"
+    [ -z "$v" ] && { printf ''; return; }
+    if [ "${#v}" -le 6 ]; then printf '******'; else printf '%s******' "${v:0:3}"; fi
+}
+
+REVEAL=0
+ALL=0
+ALL_FMT="shell"
+KEY=""
+DEF=""
+
+# Extrae --reveal en cualquier posicion.
+args=()
+for a in "$@"; do
+    if [ "$a" = "--reveal" ]; then REVEAL=1; else args+=("$a"); fi
+done
+set -- "${args[@]:-}"
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    --all) ALL=1; [ -n "${2:-}" ] && ALL_FMT="$2" ;;
+    "") echo "Falta KEY o --all." >&2; usage >&2; exit 2 ;;
+    *) KEY="$1"; DEF="${2:-}" ;;
+esac
+
+if [ "$ALL" -eq 1 ]; then
+    [ -f "$WD_CONF" ] || { echo "No existe $WD_CONF" >&2; exit 1; }
+    [ "$ALL_FMT" = "json" ] && printf '{' || true
+    first=1
+    while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        case "$line" in *=*) ;; *) continue ;; esac
+        k="${line%%=*}"
+        k="$(printf '%s' "$k" | tr -d '[:space:]')"
+        v="$(wd_conf_get "$k" '')"
+        if is_sensitive "$k" && [ "$REVEAL" -ne 1 ]; then
+            v="$(mask "$v")"
+        fi
+        if [ "$ALL_FMT" = "json" ]; then
+            ev="$(printf '%s' "$v" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+            [ "$first" -eq 1 ] || printf ','
+            first=0
+            printf '"%s":"%s"' "$k" "$ev"
+        else
+            printf "%s='%s'\n" "$k" "$v"
+        fi
+    done < "$WD_CONF"
+    [ "$ALL_FMT" = "json" ] && printf '}\n' || true
+    exit 0
+fi
+
+val="$(wd_conf_get "$KEY" "$DEF")"
+if is_sensitive "$KEY" && [ "$REVEAL" -ne 1 ]; then
+    val="$(mask "$val")"
+fi
+printf '%s\n' "$val"
