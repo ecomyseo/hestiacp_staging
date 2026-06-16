@@ -1,0 +1,90 @@
+#!/bin/bash
+# v-staging-debug - Diagnostico del plugin Staging: entorno, dependencias,
+# estado del kill switch, configuracion, ultimos logs y (opcional) detalle de un
+# entorno. No realiza cambios. Util para soporte.
+#
+# Uso: v-staging-debug [<source_domain>] [--tail N] [--format json|shell|plain] [--help]
+set -euo pipefail
+
+_bin_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+STG_ROOT="$(cd -P "$_bin_dir/.." >/dev/null 2>&1 && pwd)"
+export STG_ROOT
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Uso: v-staging-debug [<source_domain>] [opciones]
+
+Muestra un diagnostico del plugin: rutas, dependencias, kill switch, conf y los
+ultimos registros del log. Si se indica un dominio, anade el estado de su entorno.
+No modifica nada.
+
+Opciones:
+  --tail N       Numero de lineas de log a mostrar (def. 30).
+  --format <f>   Salida: plain (def.) | json | shell.
+  --help         Muestra esta ayuda.
+
+Codigos de retorno: 0 ok, 2 uso incorrecto.
+EOF
+}
+
+FORMAT="plain"
+TAILN=30
+SOURCE_DOMAIN=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --format) FORMAT="${2:-plain}"; shift 2 ;;
+        --tail) TAILN="${2:-30}"; shift 2 ;;
+        --*) printf 'ERROR: opcion desconocida: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+        *) [ -z "$SOURCE_DOMAIN" ] && SOURCE_DOMAIN="$1"; shift ;;
+    esac
+done
+case "$TAILN" in ''|*[!0-9]*) TAILN=30 ;; esac
+
+have() { command -v "$1" >/dev/null 2>&1 && printf 'yes' || printf 'no'; }
+
+KILL="$(stg_conf_get STG_PUSH_KILL_SWITCH true)"
+DBG="$(stg_conf_get DEBUG false)"
+RSYNC="$(have rsync)"; MYSQL="$(have mysql)"; PSQL="$(have psql)"; WP="$(have wp)"; CURL="$(have curl)"; FLOCK="$(have flock)"
+ENV_COUNT="$(find "$STG_ENVS_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l | tr -d '[:space:]')"
+HESTIA_OK="no"; [ -d "$STG_VBIN" ] && HESTIA_OK="yes"
+
+case "$FORMAT" in
+    json)
+        printf '{"stg_root":"%s","conf":"%s","state_dir":"%s","log_dir":"%s","push_kill_switch":"%s","debug":"%s","hestia_bin":"%s","deps":{"rsync":"%s","mysql":"%s","psql":"%s","wp":"%s","curl":"%s","flock":"%s"},"env_count":"%s"' \
+            "$STG_ROOT" "$STG_CONF" "$STG_STATE_DIR" "$STG_LOG_DIR" "$KILL" "$DBG" "$HESTIA_OK" "$RSYNC" "$MYSQL" "$PSQL" "$WP" "$CURL" "$FLOCK" "$ENV_COUNT"
+        if [ -n "$SOURCE_DOMAIN" ]; then
+            printf ',"env":'
+            "$_bin_dir/v-staging-info" "$SOURCE_DOMAIN" --format json 2>/dev/null || printf 'null'
+        fi
+        printf '}\n'
+        ;;
+    shell)
+        printf "STG_ROOT='%s'\nSTG_CONF='%s'\nSTG_PUSH_KILL_SWITCH='%s'\nDEBUG='%s'\nHESTIA_BIN='%s'\nDEP_RSYNC='%s'\nDEP_MYSQL='%s'\nDEP_PSQL='%s'\nDEP_WP='%s'\nDEP_CURL='%s'\nDEP_FLOCK='%s'\nENV_COUNT='%s'\n" \
+            "$STG_ROOT" "$STG_CONF" "$KILL" "$DBG" "$HESTIA_OK" "$RSYNC" "$MYSQL" "$PSQL" "$WP" "$CURL" "$FLOCK" "$ENV_COUNT"
+        ;;
+    *)
+        printf '== Diagnostico plugin Staging ==\n'
+        printf '  STG_ROOT        : %s\n' "$STG_ROOT"
+        printf '  Config          : %s\n' "$STG_CONF"
+        printf '  State / Logs    : %s | %s\n' "$STG_STATE_DIR" "$STG_LOG_DIR"
+        printf '  HestiaCP bin    : %s (%s)\n' "$STG_VBIN" "$HESTIA_OK"
+        printf '  Push kill switch: %s%s\n' "$KILL" "$([ "$KILL" = "true" ] && printf ' (BLOQUEADO)' || printf ' (activo)')"
+        printf '  DEBUG logs      : %s\n' "$DBG"
+        printf '  Dependencias    : rsync=%s mysql=%s psql=%s wp=%s curl=%s flock=%s\n' "$RSYNC" "$MYSQL" "$PSQL" "$WP" "$CURL" "$FLOCK"
+        printf '  Entornos        : %s\n' "$ENV_COUNT"
+        if [ -n "$SOURCE_DOMAIN" ]; then
+            printf '\n-- Entorno %s --\n' "$SOURCE_DOMAIN"
+            "$_bin_dir/v-staging-info" "$SOURCE_DOMAIN" --format plain 2>/dev/null || printf '  (sin staging registrado)\n'
+        fi
+        printf '\n-- Ultimas %s lineas de staging.log --\n' "$TAILN"
+        if [ -f "$STG_LOG_FILE" ]; then
+            tail -n "$TAILN" "$STG_LOG_FILE"
+        else
+            printf '  (sin log todavia)\n'
+        fi
+        ;;
+esac
+exit 0

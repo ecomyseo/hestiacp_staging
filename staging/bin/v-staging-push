@@ -1,0 +1,80 @@
+#!/bin/bash
+# v-staging-push - PUSH-TO-LIVE: promociona el staging a produccion (DESTRUCTIVO).
+# Envoltorio CLI de lib/push_live.sh. Protegido por las tres salvaguardas del
+# contrato: kill switch (STG_PUSH_KILL_SWITCH), backup live reciente obligatorio
+# y confirmacion explicita (STG_CONFIRM=<source_domain>).
+#
+# Uso: STG_CONFIRM=<source_domain> v-staging-push <source_domain>
+#                     [--format json|shell|plain] [--help]
+set -euo pipefail
+
+_bin_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+STG_ROOT="$(cd -P "$_bin_dir/.." >/dev/null 2>&1 && pwd)"
+export STG_ROOT
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/common.sh"
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/push_live.sh"
+
+usage() {
+    cat <<'EOF'
+Uso: STG_CONFIRM=<source_domain> v-staging-push <source_domain> [opciones]
+
+Promociona el staging a produccion. OPERACION DESTRUCTIVA sobre produccion.
+Solo se ejecuta si:
+  1) STG_PUSH_KILL_SWITCH='false' en conf/staging.conf (por defecto 'true').
+  2) Existe un backup live reciente (se genera automaticamente con v-backup-user).
+  3) Se exporta STG_CONFIRM con el nombre EXACTO del dominio de produccion.
+
+Opciones:
+  --format <f>   Salida: plain (def.) | json | shell.
+  --help         Muestra esta ayuda.
+
+Codigos de retorno: 0 ok, 1 error/abortado, 2 uso incorrecto, 5 bloqueado por kill switch.
+EOF
+}
+
+FORMAT="plain"
+SOURCE_DOMAIN=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --format) FORMAT="${2:-plain}"; shift 2 ;;
+        --confirm) export STG_CONFIRM="${2:-}"; shift 2 ;;
+        --*) printf 'ERROR: opcion desconocida: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+        *) [ -z "$SOURCE_DOMAIN" ] && SOURCE_DOMAIN="$1"; shift ;;
+    esac
+done
+[ -n "$SOURCE_DOMAIN" ] || { usage >&2; exit 2; }
+
+STG_DOMAIN="$(stg_get_env "$SOURCE_DOMAIN" STG_DOMAIN '')"
+[ -n "$STG_DOMAIN" ] || { printf 'ERROR: no hay staging para %s; nada que promover.\n' "$SOURCE_DOMAIN" >&2; exit 4; }
+
+# Pre-chequeo del kill switch para devolver codigo 5 (informativo) en la UI/CLI.
+if stg_push_blocked; then
+    case "$FORMAT" in
+        json)  printf '{"result":"BLOCKED","reason":"kill_switch","message":"STG_PUSH_KILL_SWITCH=true"}\n' ;;
+        shell) printf "RESULT='BLOCKED'\nREASON='kill_switch'\n" ;;
+        *)     printf 'BLOQUEADO: el push-to-live esta desactivado por kill switch (STG_PUSH_KILL_SWITCH=true).\n' ;;
+    esac
+    stg_audit "$SOURCE_DOMAIN" push blocked "STG_PUSH_KILL_SWITCH=true (pre-check CLI)"
+    exit 5
+fi
+
+# Flock por dominio: el push nunca debe solaparse.
+# Cerramos siempre el fd 9 al salir para liberar el lock de forma fiable
+# (evita 'lock already held' espurios si el shell se reutiliza en cron/systemd).
+trap 'exec 9>&- 2>/dev/null || true' EXIT
+LOCK_DIR="$STG_STATE_DIR/locks"; mkdir -p "$LOCK_DIR" 2>/dev/null || true
+exec 9>"$LOCK_DIR/$(_stg_safe_name "$SOURCE_DOMAIN").lock"
+command -v flock >/dev/null 2>&1 && { flock -n 9 || stg_die "Operacion en curso sobre '$SOURCE_DOMAIN'."; }
+
+# stg_push_live aplica internamente backup + confirm; aqui solo lo invocamos.
+stg_push_live "$SOURCE_DOMAIN"
+
+case "$FORMAT" in
+    json)  printf '{"result":"OK","source_domain":"%s","staging_domain":"%s","pushed_at":"%s"}\n' "$SOURCE_DOMAIN" "$STG_DOMAIN" "$(stg_get_env "$SOURCE_DOMAIN" PUSH_DONE_AT 0)" ;;
+    shell) printf "RESULT='OK'\nSOURCE_DOMAIN='%s'\nPUSH_DONE_AT='%s'\n" "$SOURCE_DOMAIN" "$(stg_get_env "$SOURCE_DOMAIN" PUSH_DONE_AT 0)" ;;
+    *)     : ;;  # stg_push_live ya imprime el resultado en modo plain.
+esac
+exit 0

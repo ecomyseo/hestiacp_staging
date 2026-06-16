@@ -1,0 +1,251 @@
+#!/bin/bash
+# v-staging-create - Crea un entorno de staging a partir de un dominio de produccion.
+# Orquesta: detect_source -> alta del dominio (v-add-web-domain) -> replica PHP
+# (v-change-web-domain-php) -> clone_files -> clone_db -> rewrite -> ssl_dns.
+# Registra la relacion produccion<->staging con stg_register_env. Usa flock por
+# dominio para impedir creaciones concurrentes del mismo origen.
+#
+# Uso: v-staging-create <user> <source_domain> [--mode subdomain|domain|user]
+#                       [--name <stg_domain>] [--format json|shell|plain] [--help]
+set -euo pipefail
+
+# Carga la libreria nucleo y los modulos a orquestar.
+_bin_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+STG_ROOT="$(cd -P "$_bin_dir/.." >/dev/null 2>&1 && pwd)"
+export STG_ROOT
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/common.sh"
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/detect_source.sh"
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/clone_files.sh"
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/clone_db.sh"
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/rewrite.sh"
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/ssl_dns.sh"
+
+usage() {
+    cat <<'EOF'
+Uso: v-staging-create <user> <source_domain> [opciones]
+
+Crea un entorno de staging clonando un dominio de produccion existente.
+
+Argumentos:
+  <user>            Usuario del panel propietario del dominio origen.
+  <source_domain>   Dominio de produccion a clonar.
+
+Opciones:
+  --mode <m>        subdomain (def.) | domain | user. Como se crea el staging:
+                    subdomain -> staging.<dominio> (mismo usuario)
+                    domain    -> dominio aparte indicado con --name (mismo usuario)
+                    user      -> dominio en un usuario de staging dedicado
+  --name <dom>      Nombre del dominio de staging (obligatorio en modo domain).
+  --format <f>      Salida: plain (def.) | json | shell.
+  --help            Muestra esta ayuda.
+
+Codigos de retorno: 0 ok, 1 error, 2 uso incorrecto, 3 ya existe.
+EOF
+}
+
+# --- Parseo de argumentos --------------------------------------------------
+USER_PANEL=""
+SOURCE_DOMAIN=""
+MODE=""
+STG_NAME=""
+FORMAT="plain"
+POS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --mode) MODE="${2:-}"; shift 2 ;;
+        --name) STG_NAME="${2:-}"; shift 2 ;;
+        --format) FORMAT="${2:-plain}"; shift 2 ;;
+        --*) printf 'ERROR: opcion desconocida: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+        *) POS+=("$1"); shift ;;
+    esac
+done
+[ "${#POS[@]}" -ge 2 ] || { usage >&2; exit 2; }
+USER_PANEL="${POS[0]}"
+SOURCE_DOMAIN="${POS[1]}"
+[ -z "$MODE" ] && MODE="$(stg_conf_get STG_DEFAULT_MODE subdomain)"
+
+case "$MODE" in subdomain|domain|user) ;; *) printf 'ERROR: modo invalido: %s\n' "$MODE" >&2; exit 2 ;; esac
+
+# --- Salida estructurada ---------------------------------------------------
+emit() {
+    # emit RESULT STG_DOMAIN STG_USER STG_DOCROOT MSG
+    local result="$1"; local sdom="$2"; local suser="$3"; local sdoc="$4"; shift 4
+    local msg="$*"
+    case "$FORMAT" in
+        json)
+            printf '{"result":"%s","source_domain":"%s","staging_domain":"%s","staging_user":"%s","docroot":"%s","mode":"%s","message":"%s"}\n' \
+                "$result" "$SOURCE_DOMAIN" "$sdom" "$suser" "$sdoc" "$MODE" "${msg//\"/\\\"}" ;;
+        shell)
+            printf "RESULT='%s'\nSTG_DOMAIN='%s'\nSTG_USER='%s'\nSTG_DOCROOT='%s'\nMODE='%s'\nMESSAGE='%s'\n" \
+                "$result" "$sdom" "$suser" "$sdoc" "$MODE" "$msg" ;;
+        *)
+            printf '%s: staging=%s user=%s docroot=%s\n%s\n' "$result" "$sdom" "$suser" "$sdoc" "$msg" ;;
+    esac
+}
+
+# --- Flock por dominio origen (evita creaciones concurrentes) --------------
+LOCK_DIR="$STG_STATE_DIR/locks"
+mkdir -p "$LOCK_DIR" 2>/dev/null || true
+LOCK_FILE="$LOCK_DIR/$(_stg_safe_name "$SOURCE_DOMAIN").lock"
+exec 9>"$LOCK_FILE" || stg_die "No se pudo abrir el lock $LOCK_FILE"
+if command -v flock >/dev/null 2>&1; then
+    flock -n 9 || stg_die "Ya hay una operacion en curso sobre '$SOURCE_DOMAIN' (lock activo)."
+fi
+
+stg_log "INFO" "v-staging-create: user=$USER_PANEL origen=$SOURCE_DOMAIN modo=$MODE"
+
+# --- Idempotencia: no recrear un staging ya existente ----------------------
+existing="$(stg_get_env "$SOURCE_DOMAIN" STG_DOMAIN '')"
+if [ -n "$existing" ]; then
+    emit "EXISTS" "$existing" "$(stg_get_env "$SOURCE_DOMAIN" STG_USER '')" \
+        "$(stg_get_env "$SOURCE_DOMAIN" STG_DOCROOT '')" \
+        "Ya existe un staging para '$SOURCE_DOMAIN'. Usa v-staging-sync o v-staging-delete."
+    exit 3
+fi
+
+# --- 1) Deteccion del origen (manifiesto sourceable) -----------------------
+SRC_MANIFEST="$(stg_detect_source "$SOURCE_DOMAIN")" || stg_die "Fallo la deteccion del origen '$SOURCE_DOMAIN'."
+# shellcheck source=/dev/null
+eval "$SRC_MANIFEST"
+[ "$SOURCE_USER" = "$USER_PANEL" ] || stg_log "WARN" "El propietario detectado ($SOURCE_USER) difiere del indicado ($USER_PANEL); uso el detectado."
+
+# --- Comprobacion de ESPACIO EN DISCO antes de clonar (obligatoria) --------
+# Necesario = ficheros del origen + tamano real de las BBDD + 15% de margen
+# (dump temporal + import). Se compara con el espacio LIBRE del filesystem
+# destino (/home/<usuario>). Aborta si no cabe; nunca empieza a copiar sin sitio.
+_stg_target_fs="/home/${SOURCE_USER}"
+[ -d "$_stg_target_fs" ] || _stg_target_fs="/home"
+_stg_avail_kb="$(df -Pk "$_stg_target_fs" 2>/dev/null | awk 'NR==2{print $4}')"
+case "$_stg_avail_kb" in ''|*[!0-9]*) _stg_avail_kb=0 ;; esac
+_stg_avail_bytes=$(( _stg_avail_kb * 1024 ))
+
+_stg_files_bytes="${SOURCE_SIZE_BYTES:-0}"
+case "$_stg_files_bytes" in ''|*[!0-9]*) _stg_files_bytes=0 ;; esac
+
+# Tamano total de las BBDD MySQL/MariaDB del origen via information_schema.
+_stg_db_bytes=0
+if [ -n "${SOURCE_DBS:-}" ] && command -v mysql >/dev/null 2>&1; then
+    while IFS='|' read -r _eng _dbn _rest; do
+        [ "$_eng" = "mysql" ] || continue
+        [ -n "$_dbn" ] || continue
+        _dbq="$(printf '%s' "$_dbn" | sed "s/'/''/g")"
+        _sz="$(mysql -N -B -e "SELECT COALESCE(SUM(data_length+index_length),0) FROM information_schema.tables WHERE table_schema='${_dbq}'" 2>/dev/null)"
+        case "$_sz" in ''|*[!0-9]*) _sz=0 ;; esac
+        _stg_db_bytes=$(( _stg_db_bytes + _sz ))
+    done <<< "$(printf '%s\n' "$SOURCE_DBS" | tr ';' '\n')"
+fi
+
+_stg_needed=$(( (_stg_files_bytes + _stg_db_bytes) * 115 / 100 ))
+_stg_avail_h="$(numfmt --to=iec "$_stg_avail_bytes" 2>/dev/null || printf '%sB' "$_stg_avail_bytes")"
+_stg_needed_h="$(numfmt --to=iec "$_stg_needed" 2>/dev/null || printf '%sB' "$_stg_needed")"
+stg_log "INFO" "Espacio en $_stg_target_fs: libre=$_stg_avail_h, necesario=$_stg_needed_h (ficheros+BBDD+15%)."
+stg_register_env "$SOURCE_DOMAIN" SPACE_AVAIL_BYTES "$_stg_avail_bytes"
+stg_register_env "$SOURCE_DOMAIN" SPACE_NEEDED_BYTES "$_stg_needed"
+if [ "$_stg_avail_bytes" -gt 0 ] && [ "$_stg_needed" -gt "$_stg_avail_bytes" ]; then
+    stg_die "Espacio insuficiente para clonar '$SOURCE_DOMAIN': se necesitan ~$_stg_needed_h y solo hay $_stg_avail_h libres en $_stg_target_fs. Libera disco y reintenta."
+fi
+if [ "${SOURCE_QUOTA_OK:-unknown}" = "no" ]; then
+    stg_die "Espacio insuficiente para clonar '$SOURCE_DOMAIN' (cuota del paquete). Libera disco y reintenta."
+fi
+
+# --- 2) Calculo del dominio y usuario de staging ---------------------------
+PATTERN="$(stg_conf_get STG_NAME_PATTERN 'staging.{domain}')"
+case "$MODE" in
+    subdomain)
+        STG_DOMAIN="${STG_NAME:-${PATTERN//\{domain\}/$SOURCE_DOMAIN}}"
+        STG_USER="$SOURCE_USER"
+        ;;
+    domain)
+        [ -n "$STG_NAME" ] || stg_die "El modo 'domain' requiere --name <dominio_staging>."
+        STG_DOMAIN="$STG_NAME"
+        STG_USER="$SOURCE_USER"
+        ;;
+    user)
+        STG_DOMAIN="${STG_NAME:-${PATTERN//\{domain\}/$SOURCE_DOMAIN}}"
+        STG_USER="$(stg_conf_get STG_STAGING_USER '')"
+        [ -n "$STG_USER" ] || STG_USER="$SOURCE_USER"
+        ;;
+esac
+STG_DOCROOT="/home/$STG_USER/web/$STG_DOMAIN/public_html"
+
+# --- 3) Alta del dominio web en HestiaCP -----------------------------------
+stg_log "INFO" "Creando dominio web de staging '$STG_DOMAIN' (user=$STG_USER)."
+if ! stg_vcmd v-add-web-domain "$STG_USER" "$STG_DOMAIN" "${STG_IP:-}" >/dev/null 2>&1; then
+    # Reintenta sin IP explicita (HestiaCP toma la IP por defecto del usuario).
+    if ! stg_vcmd v-add-web-domain "$STG_USER" "$STG_DOMAIN" >/dev/null 2>&1; then
+        stg_die "No se pudo crear el dominio de staging '$STG_DOMAIN' (v-add-web-domain)."
+    fi
+fi
+
+# --- 4) Replica de la version PHP del origen -------------------------------
+if [ -n "${SOURCE_PHP:-}" ]; then
+    stg_log "INFO" "Replicando version PHP $SOURCE_PHP en el staging."
+    stg_vcmd v-change-web-domain-php "$STG_USER" "$STG_DOMAIN" "$SOURCE_PHP" >/dev/null 2>&1 || \
+        stg_log "WARN" "No se pudo fijar PHP $SOURCE_PHP en '$STG_DOMAIN' (continuo)."
+fi
+
+# Registra la relacion base ANTES de las fases pesadas (para diagnostico/limpieza).
+stg_register_env "$SOURCE_DOMAIN" STG_DOMAIN "$STG_DOMAIN"
+stg_register_env "$SOURCE_DOMAIN" STG_USER "$STG_USER"
+stg_register_env "$SOURCE_DOMAIN" STG_DOCROOT "$STG_DOCROOT"
+stg_register_env "$SOURCE_DOMAIN" STG_MODE "$MODE"
+stg_register_env "$SOURCE_DOMAIN" SOURCE_USER "$SOURCE_USER"
+stg_register_env "$SOURCE_DOMAIN" SOURCE_DOCROOT "$SOURCE_DOCROOT"
+stg_register_env "$SOURCE_DOMAIN" SOURCE_CMS "$SOURCE_CMS"
+stg_register_env "$SOURCE_DOMAIN" SOURCE_PHP "${SOURCE_PHP:-}"
+stg_register_env "$SOURCE_DOMAIN" STG_IP "${STG_IP:-${SOURCE_DNS_A:-}}"
+stg_register_env "$SOURCE_DOMAIN" STG_CREATED_AT "$(date +%s)"
+# Marca el staging como NO produccion (verificacion de seguridad en delete).
+stg_register_env "$SOURCE_DOMAIN" IS_PRODUCTION "no"
+# Indice inverso: permite saber, desde el dominio staging, cual es su origen.
+stg_register_env "$STG_DOMAIN" PARENT_SOURCE "$SOURCE_DOMAIN"
+stg_register_env "$STG_DOMAIN" IS_PRODUCTION "no"
+
+# --- 5) Clonado de ficheros (full) -----------------------------------------
+stg_clone_files "$SOURCE_DOCROOT" "$STG_DOCROOT" "$STG_USER" "full"
+
+# --- 6) Clonado de BBDD ----------------------------------------------------
+DB_MAP=""
+STG_DB_MAP=""
+if [ -n "${SOURCE_DBS:-}" ]; then
+    # SOURCE_DBS viene como "spec;spec;..." -> array de specs.
+    IFS=';' read -ra _specs <<< "$SOURCE_DBS"
+    CLONE_OUT="$(stg_clone_db "$STG_USER" "${_specs[@]}")" || stg_die "Fallo el clonado de BBDD."
+    # CLONE_OUT: lineas engine|src_db|stg_db|real_db|stg_dbuser|stg_dbpass
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        DB_MAP="${DB_MAP:+$DB_MAP; }$line"
+        IFS='|' read -r _e _srcdb _stgdb _realdb _u _p <<< "$line"
+        STG_DB_MAP="${STG_DB_MAP:+$STG_DB_MAP;}${_srcdb}:${_realdb}"
+    done <<< "$CLONE_OUT"
+    # STG_DB_MAP (src:dst) lo consumen sync.sh y push_live.sh.
+    stg_register_env "$SOURCE_DOMAIN" STG_DB_MAP "$STG_DB_MAP"
+else
+    stg_log "INFO" "Origen sin BBDD detectadas; staging solo de ficheros."
+fi
+
+# --- 7) Reescritura URLs/credenciales -> staging ---------------------------
+stg_rewrite "$SOURCE_CMS" "$STG_DOCROOT" "$SOURCE_DOMAIN" "$STG_DOMAIN" "$DB_MAP" || \
+    stg_log "WARN" "La reescritura devolvio avisos; revisa logs/staging.log."
+
+# --- 8) SSL + DNS + proteccion (noindex/basic-auth) ------------------------
+stg_ssl_dns_apply "$SOURCE_DOMAIN" || stg_log "WARN" "SSL/DNS aplicado con avisos."
+
+# Reconstruye la config web del staging para aplicar PHP/SSL/proteccion.
+stg_vcmd v-rebuild-web-domain "$STG_USER" "$STG_DOMAIN" >/dev/null 2>&1 || \
+    stg_log "WARN" "v-rebuild-web-domain del staging devolvio error."
+
+stg_register_env "$SOURCE_DOMAIN" STG_STATUS "ready"
+stg_audit "$SOURCE_DOMAIN" create success "staging=$STG_DOMAIN user=$STG_USER mode=$MODE cms=$SOURCE_CMS"
+stg_log "INFO" "Staging '$STG_DOMAIN' creado correctamente desde '$SOURCE_DOMAIN'."
+
+emit "OK" "$STG_DOMAIN" "$STG_USER" "$STG_DOCROOT" \
+    "Staging creado. Acceso protegido (revisa Basic Auth en v-staging-info). Push-to-live BLOQUEADO por kill switch."
+exit 0

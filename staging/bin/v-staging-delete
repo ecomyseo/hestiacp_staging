@@ -1,0 +1,132 @@
+#!/bin/bash
+# v-staging-delete - Elimina UNICAMENTE el entorno de staging (dominio web + BBDD
+# clonadas + metadatos). NUNCA toca produccion: antes de borrar verifica contra
+# el estado registrado que el dominio objetivo es el STG_DOMAIN del staging y que
+# IS_PRODUCTION='no'. Si el dominio coincide con el origen, ABORTA.
+#
+# Salvaguardas: comparacion explicita staging vs produccion + confirmacion
+# (STG_CONFIRM=<source_domain>). El borrado de un dominio web es destructivo.
+#
+# Uso: STG_CONFIRM=<source_domain> v-staging-delete <source_domain>
+#                     [--format json|shell|plain] [--keep-db] [--help]
+set -euo pipefail
+
+_bin_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+STG_ROOT="$(cd -P "$_bin_dir/.." >/dev/null 2>&1 && pwd)"
+export STG_ROOT
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Uso: STG_CONFIRM=<source_domain> v-staging-delete <source_domain> [opciones]
+
+Elimina SOLO el entorno de staging (dominio web, BBDD clonadas y metadatos).
+Verifica contra el estado que el objetivo NO es produccion antes de borrar.
+Requiere confirmacion: exporta STG_CONFIRM con el nombre EXACTO del origen.
+
+Opciones:
+  --keep-db      No elimina las BBDD clonadas del staging (solo el dominio web).
+  --format <f>   Salida: plain (def.) | json | shell.
+  --help         Muestra esta ayuda.
+
+Codigos de retorno: 0 ok, 1 error, 2 uso incorrecto, 4 staging inexistente,
+                    6 abortado por seguridad (el objetivo es produccion).
+EOF
+}
+
+FORMAT="plain"
+KEEP_DB=0
+SOURCE_DOMAIN=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --format) FORMAT="${2:-plain}"; shift 2 ;;
+        --confirm) export STG_CONFIRM="${2:-}"; shift 2 ;;
+        --keep-db) KEEP_DB=1; shift ;;
+        --*) printf 'ERROR: opcion desconocida: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+        *) [ -z "$SOURCE_DOMAIN" ] && SOURCE_DOMAIN="$1"; shift ;;
+    esac
+done
+[ -n "$SOURCE_DOMAIN" ] || { usage >&2; exit 2; }
+
+STG_DOMAIN="$(stg_get_env "$SOURCE_DOMAIN" STG_DOMAIN '')"
+STG_USER="$(stg_get_env "$SOURCE_DOMAIN" STG_USER '')"
+STG_DOCROOT="$(stg_get_env "$SOURCE_DOMAIN" STG_DOCROOT '')"
+[ -n "$STG_DOMAIN" ] || { printf 'ERROR: no hay staging para %s.\n' "$SOURCE_DOMAIN" >&2; exit 4; }
+
+stg_audit "$SOURCE_DOMAIN" delete start "objetivo staging=$STG_DOMAIN"
+
+# --- SALVAGUARDA: el objetivo NO puede ser produccion ----------------------
+# 1) El dominio staging no puede coincidir con el origen.
+if [ "$STG_DOMAIN" = "$SOURCE_DOMAIN" ]; then
+    stg_audit "$SOURCE_DOMAIN" delete blocked "STG_DOMAIN==SOURCE_DOMAIN ($STG_DOMAIN)"
+    printf 'ABORTADO: el dominio de staging coincide con el de produccion (%s). No se borra nada.\n' "$STG_DOMAIN" >&2
+    exit 6
+fi
+# 2) El indice del dominio staging debe estar marcado IS_PRODUCTION='no'.
+is_prod="$(stg_get_env "$STG_DOMAIN" IS_PRODUCTION 'unknown')"
+if [ "$is_prod" = "yes" ]; then
+    stg_audit "$SOURCE_DOMAIN" delete blocked "IS_PRODUCTION=yes para $STG_DOMAIN"
+    printf 'ABORTADO: el dominio %s esta marcado como produccion. No se borra.\n' "$STG_DOMAIN" >&2
+    exit 6
+fi
+# 3) El docroot del staging debe diferir del de produccion.
+SRC_DOCROOT="$(stg_get_env "$SOURCE_DOMAIN" SOURCE_DOCROOT '')"
+if [ -n "$SRC_DOCROOT" ] && [ "$STG_DOCROOT" = "$SRC_DOCROOT" ]; then
+    stg_audit "$SOURCE_DOMAIN" delete blocked "docroot staging==produccion ($STG_DOCROOT)"
+    printf 'ABORTADO: el docroot del staging coincide con el de produccion (%s).\n' "$STG_DOCROOT" >&2
+    exit 6
+fi
+
+# --- Confirmacion explicita ------------------------------------------------
+stg_confirm "$SOURCE_DOMAIN"
+
+LOCK_DIR="$STG_STATE_DIR/locks"; mkdir -p "$LOCK_DIR" 2>/dev/null || true
+exec 9>"$LOCK_DIR/$(_stg_safe_name "$SOURCE_DOMAIN").lock"
+command -v flock >/dev/null 2>&1 && { flock -n 9 || stg_die "Operacion en curso sobre '$SOURCE_DOMAIN'."; }
+
+stg_log "INFO" "Eliminando staging '$STG_DOMAIN' (user=$STG_USER). Produccion intacta."
+
+# --- 1) Borrado de BBDD clonadas (solo las del staging, por su nombre real) -
+if [ "$KEEP_DB" -eq 0 ]; then
+    DB_MAP="$(stg_get_env "$SOURCE_DOMAIN" STG_DB_MAP '')"
+    if [ -n "$DB_MAP" ]; then
+        IFS=';' read -ra _pairs <<< "$DB_MAP"
+        for pair in "${_pairs[@]}"; do
+            [ -n "$pair" ] || continue
+            # pair = src_db:real_stg_db. Solo borramos el DESTINO (staging).
+            real_db="${pair##*:}"
+            src_db="${pair%%:*}"
+            # Doble seguridad: nunca borrar una BD cuyo nombre sea el de produccion.
+            if [ "$real_db" = "$src_db" ]; then
+                stg_log "WARN" "Omito borrado de BBDD '$real_db' (coincide con produccion)."
+                continue
+            fi
+            stg_log "INFO" "Eliminando BBDD de staging '$real_db'."
+            stg_vcmd v-delete-database "$STG_USER" "$real_db" >/dev/null 2>&1 || \
+                stg_log "WARN" "No se pudo eliminar la BBDD '$real_db' (quiza ya no exista)."
+        done
+    fi
+fi
+
+# --- 2) Borrado del dominio web del staging --------------------------------
+stg_log "INFO" "Eliminando dominio web de staging '$STG_DOMAIN'."
+if ! stg_vcmd v-delete-web-domain "$STG_USER" "$STG_DOMAIN" >/dev/null 2>&1; then
+    stg_log "WARN" "v-delete-web-domain devolvio error para '$STG_DOMAIN' (quiza ya no exista)."
+fi
+
+# --- 3) Limpieza de metadatos / indices ------------------------------------
+rm -f "$STG_ENVS_DIR/$(_stg_safe_name "$SOURCE_DOMAIN").conf" 2>/dev/null || true
+rm -f "$STG_ENVS_DIR/$(_stg_safe_name "$STG_DOMAIN").conf" 2>/dev/null || true
+rm -rf "$STG_STATE_DIR/dumps/$STG_USER" 2>/dev/null || true
+
+stg_audit "$SOURCE_DOMAIN" delete success "staging=$STG_DOMAIN eliminado (produccion intacta)"
+stg_log "INFO" "Staging '$STG_DOMAIN' eliminado. Produccion '$SOURCE_DOMAIN' intacta."
+
+case "$FORMAT" in
+    json)  printf '{"result":"OK","source_domain":"%s","deleted_staging":"%s"}\n' "$SOURCE_DOMAIN" "$STG_DOMAIN" ;;
+    shell) printf "RESULT='OK'\nDELETED_STAGING='%s'\n" "$STG_DOMAIN" ;;
+    *)     printf 'OK: staging %s eliminado. Produccion %s intacta.\n' "$STG_DOMAIN" "$SOURCE_DOMAIN" ;;
+esac
+exit 0

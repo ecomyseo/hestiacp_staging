@@ -1,0 +1,62 @@
+#!/bin/bash
+# v-staging-rollback - Revierte un push-to-live dejando produccion como estaba.
+# Envoltorio CLI de lib/rollback.sh. Operacion sobre produccion: exige
+# confirmacion explicita (STG_CONFIRM=<source_domain>) en modo manual.
+#
+# Uso: STG_CONFIRM=<source_domain> v-staging-rollback <source_domain>
+#                     [--format json|shell|plain] [--help]
+set -euo pipefail
+
+_bin_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+STG_ROOT="$(cd -P "$_bin_dir/.." >/dev/null 2>&1 && pwd)"
+export STG_ROOT
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/common.sh"
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/rollback.sh"
+
+usage() {
+    cat <<'EOF'
+Uso: STG_CONFIRM=<source_domain> v-staging-rollback <source_domain> [opciones]
+
+Restaura produccion al estado previo al ultimo push-to-live (desde .stgold y la
+config respaldada; si no estan, desde el backup live completo). Requiere
+confirmacion explicita: exporta STG_CONFIRM con el nombre EXACTO del dominio.
+
+Opciones:
+  --format <f>   Salida: plain (def.) | json | shell.
+  --help         Muestra esta ayuda.
+
+Codigos de retorno: 0 ok, 1 error/incompleto, 2 uso incorrecto, 4 staging inexistente.
+EOF
+}
+
+FORMAT="plain"
+SOURCE_DOMAIN=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --format) FORMAT="${2:-plain}"; shift 2 ;;
+        --confirm) export STG_CONFIRM="${2:-}"; shift 2 ;;
+        --*) printf 'ERROR: opcion desconocida: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+        *) [ -z "$SOURCE_DOMAIN" ] && SOURCE_DOMAIN="$1"; shift ;;
+    esac
+done
+[ -n "$SOURCE_DOMAIN" ] || { usage >&2; exit 2; }
+
+STG_DOMAIN="$(stg_get_env "$SOURCE_DOMAIN" STG_DOMAIN '')"
+[ -n "$STG_DOMAIN" ] || { printf 'ERROR: no hay staging para %s.\n' "$SOURCE_DOMAIN" >&2; exit 4; }
+
+LOCK_DIR="$STG_STATE_DIR/locks"; mkdir -p "$LOCK_DIR" 2>/dev/null || true
+exec 9>"$LOCK_DIR/$(_stg_safe_name "$SOURCE_DOMAIN").lock"
+command -v flock >/dev/null 2>&1 && { flock -n 9 || stg_die "Operacion en curso sobre '$SOURCE_DOMAIN'."; }
+
+# stg_rollback exige stg_confirm en modo manual (sin --auto).
+stg_rollback "$SOURCE_DOMAIN"
+
+case "$FORMAT" in
+    json)  printf '{"result":"OK","source_domain":"%s","rolled_back_at":"%s"}\n' "$SOURCE_DOMAIN" "$(stg_get_env "$SOURCE_DOMAIN" ROLLBACK_AT 0)" ;;
+    shell) printf "RESULT='OK'\nSOURCE_DOMAIN='%s'\nROLLBACK_AT='%s'\n" "$SOURCE_DOMAIN" "$(stg_get_env "$SOURCE_DOMAIN" ROLLBACK_AT 0)" ;;
+    *)     : ;;  # stg_rollback ya imprime el resultado.
+esac
+exit 0

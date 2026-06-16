@@ -1,0 +1,91 @@
+#!/bin/bash
+# v-staging-info - Muestra el detalle completo de un entorno de staging a partir
+# de su dominio de produccion (metadatos registrados en state/envs/<dom>.conf).
+#
+# Uso: v-staging-info <source_domain> [--format json|shell|plain] [--help]
+set -euo pipefail
+
+_bin_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+STG_ROOT="$(cd -P "$_bin_dir/.." >/dev/null 2>&1 && pwd)"
+export STG_ROOT
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Uso: v-staging-info <source_domain> [opciones]
+
+Muestra el detalle del entorno de staging asociado a un dominio de produccion.
+
+Opciones:
+  --format <f>   Salida: plain (def.) | json | shell.
+  --help         Muestra esta ayuda.
+
+Codigos de retorno: 0 ok, 2 uso incorrecto, 4 staging inexistente.
+EOF
+}
+
+FORMAT="plain"
+SOURCE_DOMAIN=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --format) FORMAT="${2:-plain}"; shift 2 ;;
+        --*) printf 'ERROR: opcion desconocida: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+        *) [ -z "$SOURCE_DOMAIN" ] && SOURCE_DOMAIN="$1"; shift ;;
+    esac
+done
+[ -n "$SOURCE_DOMAIN" ] || { usage >&2; exit 2; }
+
+STG_DOMAIN="$(stg_get_env "$SOURCE_DOMAIN" STG_DOMAIN '')"
+[ -n "$STG_DOMAIN" ] || { printf 'ERROR: no hay staging para %s.\n' "$SOURCE_DOMAIN" >&2; exit 4; }
+
+g() { stg_get_env "$SOURCE_DOMAIN" "$1" "${2:-}"; }
+
+STG_USER="$(g STG_USER)"
+STG_DOCROOT="$(g STG_DOCROOT)"
+MODE="$(g STG_MODE)"
+CMS="$(g SOURCE_CMS)"
+PHP="$(g SOURCE_PHP)"
+STATUS="$(g STG_STATUS unknown)"
+CREATED="$(g STG_CREATED_AT 0)"
+LAST_SYNC="$(g STG_LAST_SYNC_AT 0)"
+DB_MAP="$(g STG_DB_MAP)"
+SSL_KIND="$(stg_get_env "$STG_DOMAIN" SSL_KIND none)"
+HTTP_CHECK="$(stg_get_env "$STG_DOMAIN" HTTP_CHECK '')"
+BASIC_USER="$(stg_get_env "$STG_DOMAIN" BASIC_AUTH_USER '')"
+PUSH_DONE="$(g PUSH_DONE_AT 0)"
+ROLLBACK_AT="$(g ROLLBACK_AT 0)"
+KILL="$(stg_conf_get STG_PUSH_KILL_SWITCH true)"
+
+human_date() { [ "${1:-0}" -gt 0 ] 2>/dev/null && date -d "@$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf 'n/d'; }
+
+case "$FORMAT" in
+    json)
+        printf '{"source_domain":"%s","staging_domain":"%s","staging_user":"%s","docroot":"%s","mode":"%s","cms":"%s","php":"%s","status":"%s","ssl":"%s","http_check":"%s","basic_auth_user":"%s","db_map":"%s","created_at":"%s","last_sync_at":"%s","pushed_at":"%s","rolled_back_at":"%s","push_kill_switch":"%s"}\n' \
+            "$SOURCE_DOMAIN" "$STG_DOMAIN" "$STG_USER" "$STG_DOCROOT" "$MODE" "$CMS" "$PHP" "$STATUS" "$SSL_KIND" "$HTTP_CHECK" "$BASIC_USER" "$DB_MAP" "$CREATED" "$LAST_SYNC" "$PUSH_DONE" "$ROLLBACK_AT" "$KILL"
+        ;;
+    shell)
+        printf "SOURCE_DOMAIN='%s'\nSTG_DOMAIN='%s'\nSTG_USER='%s'\nSTG_DOCROOT='%s'\nSTG_MODE='%s'\nSOURCE_CMS='%s'\nSOURCE_PHP='%s'\nSTG_STATUS='%s'\nSSL_KIND='%s'\nHTTP_CHECK='%s'\nBASIC_AUTH_USER='%s'\nSTG_DB_MAP='%s'\nSTG_CREATED_AT='%s'\nSTG_LAST_SYNC_AT='%s'\nPUSH_DONE_AT='%s'\nROLLBACK_AT='%s'\nSTG_PUSH_KILL_SWITCH='%s'\n" \
+            "$SOURCE_DOMAIN" "$STG_DOMAIN" "$STG_USER" "$STG_DOCROOT" "$MODE" "$CMS" "$PHP" "$STATUS" "$SSL_KIND" "$HTTP_CHECK" "$BASIC_USER" "$DB_MAP" "$CREATED" "$LAST_SYNC" "$PUSH_DONE" "$ROLLBACK_AT" "$KILL"
+        ;;
+    *)
+        printf 'Entorno de staging para %s\n' "$SOURCE_DOMAIN"
+        printf '  Dominio staging : %s\n' "$STG_DOMAIN"
+        printf '  Usuario         : %s\n' "$STG_USER"
+        printf '  Docroot         : %s\n' "$STG_DOCROOT"
+        printf '  Modo            : %s\n' "$MODE"
+        printf '  CMS / PHP       : %s / %s\n' "$CMS" "${PHP:-?}"
+        printf '  Estado          : %s\n' "$STATUS"
+        printf '  SSL             : %s\n' "$SSL_KIND"
+        printf '  Comprobacion HTTP: %s\n' "${HTTP_CHECK:-n/d}"
+        printf '  Basic Auth user : %s\n' "${BASIC_USER:-no}"
+        printf '  Mapa BBDD       : %s\n' "${DB_MAP:-(ninguno)}"
+        printf '  Creado          : %s\n' "$(human_date "$CREATED")"
+        printf '  Ultimo sync     : %s\n' "$(human_date "$LAST_SYNC")"
+        printf '  Ultimo push     : %s\n' "$(human_date "$PUSH_DONE")"
+        printf '  Ultimo rollback : %s\n' "$(human_date "$ROLLBACK_AT")"
+        printf '  Push kill switch: %s%s\n' "$KILL" "$([ "$KILL" = "true" ] && printf ' (BLOQUEADO)' || printf ' (activo)')"
+        ;;
+esac
+exit 0

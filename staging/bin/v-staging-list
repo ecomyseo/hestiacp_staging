@@ -1,0 +1,109 @@
+#!/bin/bash
+# v-staging-list - Lista los entornos de staging registrados (opcionalmente de un
+# usuario). Lee state/envs/*.conf. Solo muestra entornos staging (los que tienen
+# PARENT_SOURCE son indices inversos y se omiten; se listan por dominio ORIGEN).
+#
+# Uso: v-staging-list [<user>] [--format json|shell|plain] [--help]
+set -euo pipefail
+
+_bin_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+STG_ROOT="$(cd -P "$_bin_dir/.." >/dev/null 2>&1 && pwd)"
+export STG_ROOT
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Uso: v-staging-list [<user>] [opciones]
+
+Lista los entornos de staging registrados. Si se indica <user>, filtra por el
+usuario propietario del staging.
+
+Opciones:
+  --format <f>   Salida: plain (def.) | json | shell.
+  --help         Muestra esta ayuda.
+
+Codigos de retorno: 0 ok, 2 uso incorrecto.
+EOF
+}
+
+FORMAT="plain"
+FILTER_USER=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --format) FORMAT="${2:-plain}"; shift 2 ;;
+        --*) printf 'ERROR: opcion desconocida: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+        *) [ -z "$FILTER_USER" ] && FILTER_USER="$1"; shift ;;
+    esac
+done
+
+# Extrae KEY='VALUE' de un fichero conf SIN abortar si la clave no existe
+# (grep devolveria 1 y, con set -e + pipefail, abortaria el listado completo).
+_envget() {
+    grep -E "^$1=" "$2" 2>/dev/null | head -n1 | sed "s/^$1='//; s/'$//" || true
+}
+
+# Recolecta los entornos: ficheros con STG_DOMAIN definido (dominios ORIGEN).
+rows=()
+for f in "$STG_ENVS_DIR"/*.conf; do
+    [ -f "$f" ] || continue
+    # Un fichero de origen tiene STG_DOMAIN; los indices inversos tienen PARENT_SOURCE.
+    grep -qE "^STG_DOMAIN=" "$f" 2>/dev/null || continue
+    src="$(basename "$f" .conf)"
+    # Recupera el dominio origen real desde el metadato (el nombre de fichero esta saneado).
+    sdom="$(_envget STG_DOMAIN "$f")"
+    suser="$(_envget STG_USER "$f")"
+    smode="$(_envget STG_MODE "$f")"
+    scms="$(_envget SOURCE_CMS "$f")"
+    sstatus="$(_envget STG_STATUS "$f")"
+    screated="$(_envget STG_CREATED_AT "$f")"
+    ssync="$(_envget STG_LAST_SYNC_AT "$f")"
+    # El dominio origen es el nombre logico almacenado: lo derivamos del fichero inverso
+    # buscando el PARENT_SOURCE del dominio staging; si no, usamos el nombre saneado.
+    src_domain="$src"
+    inv="$STG_ENVS_DIR/$(printf '%s' "$sdom" | tr -c 'A-Za-z0-9._-' '_').conf"
+    if [ -f "$inv" ]; then
+        p="$(_envget PARENT_SOURCE "$inv")"
+        [ -n "$p" ] && src_domain="$p"
+    fi
+    [ -n "$FILTER_USER" ] && [ "$suser" != "$FILTER_USER" ] && continue
+    rows+=("$src_domain|$sdom|$suser|${smode:-?}|${scms:-?}|${sstatus:-?}|${screated:-0}|${ssync:-0}")
+done
+
+case "$FORMAT" in
+    json)
+        printf '['
+        first=1
+        for r in "${rows[@]}"; do
+            IFS='|' read -r sd dm us mo cm st cr sy <<< "$r"
+            [ "$first" -eq 1 ] || printf ','
+            first=0
+            printf '{"source_domain":"%s","staging_domain":"%s","user":"%s","mode":"%s","cms":"%s","status":"%s","created_at":"%s","last_sync_at":"%s"}' \
+                "$sd" "$dm" "$us" "$mo" "$cm" "$st" "$cr" "$sy"
+        done
+        printf ']\n'
+        ;;
+    shell)
+        i=0
+        for r in "${rows[@]}"; do
+            IFS='|' read -r sd dm us mo cm st cr sy <<< "$r"
+            printf "STG_%d_SOURCE='%s'\nSTG_%d_DOMAIN='%s'\nSTG_%d_USER='%s'\nSTG_%d_MODE='%s'\nSTG_%d_CMS='%s'\nSTG_%d_STATUS='%s'\n" \
+                "$i" "$sd" "$i" "$dm" "$i" "$us" "$i" "$mo" "$i" "$cm" "$i" "$st"
+            i=$((i+1))
+        done
+        printf "STG_COUNT='%d'\n" "${#rows[@]}"
+        ;;
+    *)
+        if [ "${#rows[@]}" -eq 0 ]; then
+            printf 'No hay entornos de staging registrados.\n'
+        else
+            printf '%-30s %-30s %-12s %-9s %-10s %-8s\n' "ORIGEN" "STAGING" "USUARIO" "MODO" "CMS" "ESTADO"
+            for r in "${rows[@]}"; do
+                IFS='|' read -r sd dm us mo cm st cr sy <<< "$r"
+                printf '%-30s %-30s %-12s %-9s %-10s %-8s\n' "$sd" "$dm" "$us" "$mo" "$cm" "$st"
+            done
+        fi
+        ;;
+esac
+exit 0

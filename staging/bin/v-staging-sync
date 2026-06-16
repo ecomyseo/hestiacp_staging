@@ -1,0 +1,65 @@
+#!/bin/bash
+# v-staging-sync - Re-sincroniza produccion -> staging (ficheros y/o BBDD).
+# Envoltorio CLI de lib/sync.sh. Operacion SEGURA: solo escribe sobre el staging.
+#
+# Uso: v-staging-sync <source_domain> [--files-only|--db-only] [--exclude-uploads]
+#                     [--format json|shell|plain] [--help]
+set -euo pipefail
+
+_bin_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+STG_ROOT="$(cd -P "$_bin_dir/.." >/dev/null 2>&1 && pwd)"
+export STG_ROOT
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/common.sh"
+# shellcheck source=/dev/null
+. "$STG_ROOT/lib/sync.sh"
+
+usage() {
+    cat <<'EOF'
+Uso: v-staging-sync <source_domain> [opciones]
+
+Vuelve a traer ficheros y/o BBDD desde produccion hacia el staging existente.
+Hace backup del propio staging antes de sobreescribir y re-aplica la reescritura.
+
+Opciones:
+  --files-only       Solo ficheros (no toca la BBDD del staging).
+  --db-only          Solo BBDD (no toca ficheros del staging).
+  --exclude-uploads  No re-sincroniza uploads voluminosos.
+  --format <f>       Salida: plain (def.) | json | shell.
+  --help             Muestra esta ayuda.
+
+Codigos de retorno: 0 ok, 1 error, 2 uso incorrecto, 4 staging inexistente.
+EOF
+}
+
+FORMAT="plain"
+SARGS=()
+SOURCE_DOMAIN=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --format) FORMAT="${2:-plain}"; shift 2 ;;
+        --files-only|--db-only|--exclude-uploads) SARGS+=("$1"); shift ;;
+        --*) printf 'ERROR: opcion desconocida: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+        *) [ -z "$SOURCE_DOMAIN" ] && SOURCE_DOMAIN="$1"; shift ;;
+    esac
+done
+[ -n "$SOURCE_DOMAIN" ] || { usage >&2; exit 2; }
+
+STG_DOMAIN="$(stg_get_env "$SOURCE_DOMAIN" STG_DOMAIN '')"
+[ -n "$STG_DOMAIN" ] || { printf 'ERROR: no hay staging para %s.\n' "$SOURCE_DOMAIN" >&2; exit 4; }
+
+# Flock por dominio: evita sync concurrente.
+LOCK_DIR="$STG_STATE_DIR/locks"; mkdir -p "$LOCK_DIR" 2>/dev/null || true
+exec 9>"$LOCK_DIR/$(_stg_safe_name "$SOURCE_DOMAIN").lock"
+command -v flock >/dev/null 2>&1 && { flock -n 9 || stg_die "Operacion en curso sobre '$SOURCE_DOMAIN'."; }
+
+stg_sync "$SOURCE_DOMAIN" ${SARGS[@]+"${SARGS[@]}"}
+
+LAST="$(stg_get_env "$SOURCE_DOMAIN" STG_LAST_SYNC_AT '0')"
+case "$FORMAT" in
+    json)  printf '{"result":"OK","source_domain":"%s","staging_domain":"%s","last_sync_at":"%s"}\n' "$SOURCE_DOMAIN" "$STG_DOMAIN" "$LAST" ;;
+    shell) printf "RESULT='OK'\nSTG_DOMAIN='%s'\nSTG_LAST_SYNC_AT='%s'\n" "$STG_DOMAIN" "$LAST" ;;
+    *)     printf 'OK: staging %s re-sincronizado desde %s.\n' "$STG_DOMAIN" "$SOURCE_DOMAIN" ;;
+esac
+exit 0
