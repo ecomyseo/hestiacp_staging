@@ -1,3 +1,17 @@
+# HestiaCP Watchdog & Staging plugins
+
+**Two self-contained HestiaCP plugins: server monitoring (Watchdog) and one-click staging clones of domains and databases with push-to-live.**
+
+- Staging clones with push-to-live
+- Server watchdog
+- Integrated in the panel and as v-* commands
+
+> 🇪🇸 Documentación completa en castellano más abajo · Full docs below (Spanish).
+
+⭐ If this saves you time, a star helps other people find it.
+
+---
+
 # HestiaCP Plugins — Watchdog & Staging
 
 > Dos plugins autocontenidos para [HestiaCP](https://hestiacp.com/) que añaden
